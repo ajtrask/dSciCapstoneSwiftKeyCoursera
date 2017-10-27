@@ -1,0 +1,77 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(stringi)
+```
+
+# Exploring the Data
+
+## How big?
+
+### File Size
+```{r}
+en_files <- Sys.glob("final/en_US/*.txt")
+
+file.info(en_files)
+```
+
+### Number of Lines
+```{r}
+numlines <- rep_len(0,length(en_files))
+for (i in 1:length(en_files)) {
+  con <- file(en_files[i], open="r")
+  numlines[i] <- length(readLines(con))
+  close(con)
+}
+data.frame(en_files,numlines)
+```
+
+### Longest Line
+```{r}
+maxlinelength <- rep_len(0,length(en_files))
+for (i in 1:length(en_files)) {
+  con <- file(en_files[i], open="r")
+  while (TRUE) {
+    line <- readLines(con, n=1)
+    if (length(line)==0) {
+      break
+    }
+    strlength <- stri_length(line)
+    if (strlength>maxlinelength[i]) {
+      maxlinelength[i] <- strlength
+    }
+  }
+  close(con)
+}
+data.frame(en_files,maxlinelength)
+```
+
+### Twitter Love-Hate Ratio
+```{r}
+con <- file('final/en_US/en_US.twitter.txt', open="r")
+tweets <- readLines(con)
+close(con)
+
+love <- sum(stri_detect_fixed(tweets, 'love'))
+hate <- sum(stri_detect_fixed(tweets, 'hate'))
+
+love/hate
+```
+
+### Tweet About Biostats
+```{r}
+biostats <- stri_detect_fixed(tweets, 'biostats')
+
+tweets[biostats>0]
+```
+
+### Tweets About Kickboxing a Computer
+```{r}
+kickboxing <- stri_detect_fixed(tweets, 'A computer once beat me at chess, but it was no match for me at kickboxing')
+
+tweets[kickboxing>0]
+
+```
