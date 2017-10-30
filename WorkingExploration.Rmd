@@ -1,0 +1,436 @@
+---
+title: "Working Exploration"
+output: html_notebook
+---
+
+
+## Project Overview
+The goal of this project is to predict the next word in a sequence using an ngram model.  The training data cleaned and explored here is free text extracted from blogs, news articles, and twitter.  Tidytext and other supporting packages are used to clean the data and build the model.
+
+```{r, message=FALSE}
+library(dplyr)
+library(tidytext)
+library(stringr)
+library(ggplot2)
+library(hunspell)
+```
+
+## Data Exploration
+### English language files:
+```{r}
+en_files <- Sys.glob("final/en_US/*.txt")
+file.info(en_files)
+```
+
+### Cleaning and Word frequency:
+```{r}
+# create empty data frame
+corpora_words <- data.frame(txt_source=character(),
+                            txt_language=character(),
+                            words=character(),
+                            n=integer(),
+                            stringsAsFactors = FALSE)
+
+# loop over files and convert to corpora
+for (i in 1:length(en_files)) {
+  # create some meta data from the file name
+  explodePath <- unlist(strsplit(en_files[i], "[.]|[/]"))
+  
+  # read in the file to a data frame with rows for each line
+  con <- file(en_files[i], open="r")
+  allLines <- readLines(con)
+  close(con)
+  words <- data.frame(txt_source=explodePath[4],
+                      txt_language=explodePath[3],
+                      txt_lines=allLines,
+                      stringsAsFactors = FALSE)
+  
+  # tokenize and group words to get word frequency
+  words <- words %>%
+    unnest_tokens(word, txt_lines) %>%
+    count(txt_source, txt_language, word, sort = TRUE) %>%
+    ungroup()
+
+  # append data frame
+  corpora_words <- rbind(corpora_words, words)
+}
+
+# convert source and language to factor
+corpora_words$txt_source <- as.factor(corpora_words$txt_source)
+corpora_words$txt_language <- as.factor(corpora_words$txt_language)
+
+summary(corpora_words)
+```
+
+Looking at the tail of frequent words, we see that their are many messy types and we will need to clean them.
+```{r}
+tail(corpora_words)
+```
+
+Here we filter out words with punctuation, special characters, numbers, curse words, and non-english dictionary words (Note: this step will need to be performed after forming ngrams to avoid introducing more prediction errors):
+```{r}
+# read in profanity word list from Shutterstock project located at
+# https://github.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words
+con <- file("../List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/en", open="r")
+profanity <- readLines(con)
+close(con)
+
+corpora_filtered <- corpora_words %>% 
+  filter(!word %in% profanity) %>% # only keep words that aren't profanity
+  filter(str_detect(word, "^[:alpha:]+$")) %>% # only keep words with alphabetic characters
+  filter(!str_detect(word, "([:alpha:])\\1{2,}")) %>% # remove words with 3 or more repeated characters
+  filter(hunspell_check(word, dict = "en_US")) # remove words not in the english dictionary
+
+summary(corpora_filtered)
+```
+
+This is a significant reduction in word count.  To improve the data, we might consider fixing the spelling of the words with the spell check, however this might introduce more errors.
+
+The following is a histogram of the number of times a word appears in each source divided by the total number of words in each source.  This gives us an idea of the distribution of word occurance.  Lets calculate the word count from each source and produce a histogram.
+```{r}
+# calculate word count in each file
+total_words <- corpora_filtered %>%
+  group_by(txt_source, txt_language) %>% 
+  summarize(total = sum(n))
+
+# add word counts to data frame
+corpora_filtered <- left_join(corpora_filtered, total_words)
+```
+
+```{r}
+ggplot(corpora_filtered, aes(n/total, fill = txt_source)) +
+  geom_histogram(binwidth = 1e-06, show.legend = FALSE) +
+  xlim(NA, 0.00005) +
+  facet_wrap(~txt_source, ncol = 3, scales = "free_y")
+```
+
+```{r}
+head(corpora_filtered)
+```
+
+```{r}
+tail(corpora_filtered)
+```
+
+Stop words which appear at the top of the term frequency ordered data frame are likely not a good predictor in an ngram model however, they are part of natural language and will need to be included.
+
+The TF-IDF score on each word gives us an idea of the difference between the three sources of text.
+```{r, results="hide"}
+corpora_filtered <- corpora_filtered %>%
+  bind_tf_idf(word, txt_source, n)
+
+head(corpora_filtered)
+```
+
+```{r, results="hide", fig.show="hide"}
+plot_txt <- corpora_filtered %>%
+  arrange(desc(tf_idf)) %>%
+  mutate(word = factor(word, levels = rev(unique(word))))
+
+plot_txt %>% 
+  group_by(txt_source,txt_language) %>% 
+  top_n(15) %>% 
+  ungroup %>%
+  ggplot(aes(word, tf_idf, fill = txt_source)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~txt_source, ncol = 3, scales = "free") +
+  coord_flip()
+```
+
+
+
+
+#### Bigram frequency:
+```{r}
+# create empty data frame
+corpora_bigrams <- data.frame(txt_source=character(),
+                            txt_language=character(),
+                            bigram=character(),
+                            n=integer(),
+                            stringsAsFactors = FALSE)
+
+# loop over files and convert to corpora
+for (i in 1:length(en_files)) {
+  # create some meta data from the file name
+  explodePath <- unlist(strsplit(en_files[i], "[.]|[/]"))
+  
+  # read in the file to a data frame with rows for each line
+  con <- file(en_files[i], open="r")
+  allLines <- readLines(con)
+  close(con)
+  docs <- data.frame(txt_source=explodePath[4],
+                     txt_language=explodePath[3],
+                     txt_lines=allLines,
+                     stringsAsFactors = FALSE)
+  
+  # tokenize and group words to get word frequency
+  bigrams <- docs %>%
+    unnest_tokens(bigram, txt_lines, token = "ngrams", n = 2) %>%
+    count(txt_source, txt_language, bigram, sort = TRUE) %>%
+    ungroup()
+
+  # append data frame
+  corpora_bigrams <- rbind(corpora_bigrams, bigrams)
+}
+
+# calculate word count in each file
+total_bigrams <- corpora_bigrams %>%
+  group_by(txt_source, txt_language) %>% 
+  summarize(total = sum(n))
+
+# add word counts to data frame
+corpora_bigrams <- left_join(corpora_bigrams, total_bigrams)
+
+# convert source and language to factor
+corpora_bigrams$txt_source <- as.factor(corpora_bigrams$txt_source)
+corpora_bigrams$txt_language <- as.factor(corpora_bigrams$txt_language)
+
+head(corpora_bigrams)
+```
+
+```{r}
+# compute tf-idf
+corpora_bigrams <- corpora_bigrams %>%
+  bind_tf_idf(bigram, txt_source, n) %>%
+  arrange(desc(tf_idf))
+
+head(corpora_bigrams)
+```
+
+```{r}
+plot_bigrams <- corpora_bigrams %>%
+  arrange(desc(tf_idf)) %>%
+  mutate(bigram = factor(bigram, levels = rev(unique(bigram))))
+
+plot_bigrams %>% 
+  group_by(txt_source) %>% 
+  top_n(15) %>% 
+  ungroup %>%
+  ggplot(aes(bigram, tf_idf, fill = txt_source)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~txt_source, ncol = 3, scales = "free") +
+  coord_flip()
+```
+
+```{r}
+bigrams_separated <- corpora_bigrams %>%
+  separate(bigram, c("word1", "word2"), sep = " ")
+```
+
+```{r}
+bigram_counts <- bigrams_separated %>% 
+  count(word1, word2, sort = TRUE)
+```
+
+```{r}
+bigram_graph <- bigram_counts %>%
+  filter(nn > 1) # %>%
+  #graph_from_data_frame()
+
+bigram_graph
+
+```
+
+```{r}
+library(ggraph)
+set.seed(2017)
+
+ggraph(bigram_graph, layout = "fr") +
+  geom_edge_link() +
+  geom_node_point() +
+  geom_node_text(aes(label = name), vjust = 1, hjust = 1)
+```
+
+
+
+
+
+
+```{r}
+library(widyr)
+library(igraph)
+library(ggraph)
+```
+
+```{r}
+keyword_cors <- corpora_words %>% 
+  group_by(word) %>%
+  filter(n>=50) #%>%
+  #pairwise_cor(word, id, sort = TRUE, upper = FALSE)
+
+tail(keyword_cors)
+```
+
+```{r}
+set.seed(1234)
+keyword_cors %>%
+  filter(correlation > .6) %>%
+  graph_from_data_frame() %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(edge_alpha = correlation, edge_width = correlation), edge_colour = "royalblue") +
+  geom_node_point(size = 5) +
+  geom_node_text(aes(label = name), repel = TRUE,
+                 point.padding = unit(0.2, "lines")) +
+  theme_void()
+```
+
+## 1.Some words are more frequent than others - what are the distributions of word frequencies? 
+```{r}
+corpora_words <- corpora %>%
+  unnest_tokens(word, txt_lines) %>%
+  count(txt_source, word, sort = TRUE) %>%
+  ungroup()
+
+total_words <- corpora_words %>%
+  group_by(txt_source) %>% 
+  summarize(total = sum(n))
+
+corpora_words <- left_join(corpora_words, total_words)
+
+head(corpora_words)
+```
+
+
+```{r}
+ggplot(corpora_words, aes(n/total, fill = txt_source)) +
+  geom_histogram(show.legend = FALSE) +
+  xlim(NA, 0.00005) +
+  facet_wrap(~txt_source, ncol = 2, scales = "free_y")
+```
+
+##2.What are the frequencies of 2-grams and 3-grams in the dataset? 
+```{r}
+
+corpora_2ngrams <- corpora %>%
+  unnest_tokens(ngram, txt_lines, token = "ngrams", n = 2) %>%
+  count(txt_source, ngram, sort = TRUE) %>%
+  ungroup()
+
+total_2ngrams <- corpora_2ngrams %>%
+  group_by(txt_source) %>% 
+  summarize(total = sum(n))
+
+corpora_2ngrams <- left_join(corpora_2ngrams, total_2ngrams)
+
+head(corpora_2ngrams)
+```
+
+```{r}
+ggplot(corpora_2ngrams, aes(n/total, fill = txt_source)) +
+  geom_histogram(show.legend = FALSE) +
+  xlim(NA, 0.00001) +
+  facet_wrap(~txt_source, ncol = 2, scales = "free_y")
+```
+
+```{r}
+
+corpora_3ngrams <- corpora %>%
+  unnest_tokens(ngram, txt_lines, token = "ngrams", n = 3) %>%
+  count(txt_source, ngram, sort = TRUE) %>%
+  ungroup()
+
+total_3ngrams <- corpora_3ngrams %>%
+  group_by(txt_source) %>% 
+  summarize(total = sum(n))
+
+corpora_3ngrams <- left_join(corpora_3ngrams, total_3ngrams)
+
+head(corpora_3ngrams)
+```
+
+```{r}
+ggplot(corpora_3ngrams, aes(n/total, fill = txt_source)) +
+  geom_histogram(show.legend = FALSE) +
+  xlim(NA, 0.00001) +
+  facet_wrap(~txt_source, ncol = 2, scales = "free_y")
+```
+
+##3.How many unique words do you need in a frequency sorted dictionary to cover 50% of all word instances in the language? 90%? 
+
+- how many words in the english language? (good source of english language corpus?)
+- Corpus of Contemporary American English (~20 million words in a given year): https://corpus.byu.edu/coca/ 
+
+##4.How do you evaluate how many of the words come from foreign languages? 
+
+- compare to english language dictionary (false positive on misspellings, slang, colloquialisms, formal nouns, leetspeak)
+
+##5.Can you think of a way to increase the coverage -- identifying words that may not be in the corpora or using a smaller number of words in the dictionary to cover the same number of phrases?
+
+- grab other styles of writing samples (journals, magazines, e-books, speech transcripts)
+
+## Modelling
+
+### Tasks to accomplish
+
+Build basic n-gram model - using the exploratory analysis you performed, build a basic n-gram model for predicting the next word based on the previous 1, 2, or 3 words.
+
+Build a model to handle unseen n-grams - in some cases people will want to type a combination of words that does not appear in the corpora. Build a model to handle cases where a particular n-gram isn't observed.
+
+### Questions to consider
+
+How can you efficiently store an n-gram model (think Markov Chains)?
+
+How can you use the knowledge about word frequencies to make your model smaller and more efficient?
+
+How many parameters do you need (i.e. how big is n in your n-gram model)?
+
+Can you think of simple ways to "smooth" the probabilities (think about giving all n-grams a non-zero probability even if they aren't observed in the data) ?
+
+How do you evaluate whether your model is any good?
+
+How can you use backoff models to estimate the probability of unobserved n-grams?
+
+
+
+## Preliminary Modelling
+### Generate N-Grams with *** Probabilities ***
+
+```{r}
+# create empty data frame
+corpora_bigrams <- data.frame(word1=character(),
+                              word2=character(),
+                              n=integer(),
+                              stringsAsFactors = FALSE)
+
+# loop over files and convert to bigrams
+for (i in 1:length(en_files)) {
+  # read in the file to a data frame with rows for each line
+  con <- file(en_files[i], open="r")
+  allLines <- readLines(con)
+  close(con)
+  docs <- data.frame(txt_lines=allLines,
+                     stringsAsFactors = FALSE)
+  
+  # tokenize and group words to get word frequency
+  bigrams <- docs %>%
+    unnest_tokens(bigram, txt_lines, token = "ngrams", n = 2, to_lower = TRUE) %>%
+    separate(bigram, c("word1", "word2"), sep = " ") %>%
+    count(word1, word2, sort = TRUE)
+
+  # append data frame
+  corpora_bigrams <- rbind(corpora_bigrams, bigrams)
+}
+
+# calculate word count in each file
+total_bigrams <- corpora_bigrams %>%
+  summarize(total = sum(n))
+
+# add word counts to data frame
+corpora_bigrams$prob <- corpora_bigrams$n/total_bigrams$total
+
+head(corpora_bigrams)
+```
+
+
+
+
+## Helper Functions:
+
+object.size(): this function reports the number of bytes that an R object occupies in memory
+
+Rprof(): this function runs the profiler in R that can be used to determine where bottlenecks in your function may exist. The profr package (available on CRAN) provides some additional tools for visualizing and summarizing profiling data.
+
+gc(): this function runs the garbage collector to retrieve unused RAM for R. In the process it tells you how much memory is currently being used by R.
+

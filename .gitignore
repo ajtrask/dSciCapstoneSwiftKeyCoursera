@@ -31,3 +31,10 @@ vignettes/*.pdf
 # Temporary files created by R markdown
 *.utf8.md
 *.knit.md
+
+# Ignore data folder
+final
+*.dcf
+en_US.twitter.sampled.txt
+en_US.news.sampled.txt
+en_US.blogs.sampled.txt
