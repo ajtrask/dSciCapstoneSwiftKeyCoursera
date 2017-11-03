@@ -1,0 +1,233 @@
+---
+title: "Word Prediction Model"
+author: "Aaron Trask"
+date: "November 1, 2017"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+## Designing a Prediction Model
+
+```{r, message=FALSE}
+library(dplyr)
+library(tidytext)
+library(stringr)
+library(ggplot2)
+library(hunspell)
+library(tidyr)
+library(igraph)
+library(ggraph)
+```
+
+## Data Preparation
+
+We are working with the sampled files.  Run sampleSourceFiles.R if they do not exist.
+```{r}
+sample_en_files <- Sys.glob("en_US.*.sampled.txt")
+file.info(sample_en_files)
+```
+
+Create function for creating and cleaning ngram data frames.
+```{r}
+create_ngrams <- function(files,n) {
+  # create empty data frame
+  df <- data.frame()
+
+  # loop over files and convert to corpora
+  for (i in 1:length(files)) {
+    
+    # read in the file to a data frame with rows for each line
+    con <- file(sample_en_files[i], open="r")
+    allLines <- readLines(con)
+    close(con)
+    
+    # tokenize into ngrams
+    ngrams <- data.frame(txt_lines=allLines, stringsAsFactors = FALSE) %>% 
+      unnest_tokens(ngram, txt_lines, token = "ngrams", n = n)
+    
+    # append data frame
+    df <- rbind(df, ngrams)
+  }
+  
+  # add word count and separate words
+  cols <- paste(rep("word",n), c(1:n), sep="")
+  df <- df %>%
+    count(ngram, sort = TRUE) %>%
+    ungroup() %>%
+    separate(ngram, cols, sep = " ")
+  
+  # read in profanity word list from Shutterstock project located at
+  # https://github.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words
+  con <- file("../List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/en", open="r")
+  profanity <- readLines(con)
+  close(con)
+
+  # filter out profanity, non-alphabetic characters, and 3 or more
+  # repeated characters
+  df <- df %>%
+    # only keep words that aren't profanity
+    filter_at(vars(starts_with("word")), any_vars(!(. %in% profanity))) %>%
+    # only keep words with alphabetic characters
+    filter_at(vars(starts_with("word")), any_vars(str_detect(., "^[:alpha:]+$"))) %>%
+    # remove words with 3 or more repeated characters
+    filter_at(vars(starts_with("word")), any_vars(!str_detect(., "([:alpha:])\\1{2,}"))) #%>%
+    # remove words not in the english dictionary
+    #filter_at(vars(starts_with("word")), any_vars(hunspell_check(word, dict = "en_US")))
+  
+  # calculate count of ngrams
+  total_ngrams <- df %>%  summarize(total = sum(n))
+
+  # compute probability
+  #df$prob <- df$n/total_ngrams$total
+  
+  # compute log(p)
+  df$logprob <- log(df$n) - log(total_ngrams$total)
+  
+  return(df)
+}
+```
+
+
+TODO: keep hash tags
+TODO: keep ampersands
+TODO: replace contractions with words
+TODO: filter profanity inside concatenated words
+
+```{r}
+unigrams <- create_ngrams(sample_en_files,1)
+head(unigrams)
+```
+
+```{r}
+bigrams <- create_ngrams(sample_en_files,2)
+head(bigrams)
+```
+
+```{r}
+trigrams <- create_ngrams(sample_en_files,3)
+head(trigrams)
+```
+
+```{r}
+quadgrams <- create_ngrams(sample_en_files,4)
+head(quadgrams)
+```
+
+## Compute Kneser-Ney smoothed probabilities for handling missing ngrams
+
+```{r}
+bigram_count <- count(bigrams)$nn
+bigram_count
+```
+```{r}
+unigrams$prob_continuation <- by(unigrams, 1:nrow(unigrams), function(row) count(bigrams[bigrams$word2==row$word1,])/bigram_count)
+```
+
+```{r}
+unigrams[1,]$word1
+```
+
+```{r}
+bigrams[bigrams$word2=="the",]
+```
+
+
+```{r}
+# compute Kneser-Ney smoothed probability for unigram
+unigram$knprob_continuation <- count(bigrams$word2==unigrams$word1)/bigram_count
+```
+
+## Model
+
+Trades:
+- model size
+- model runtime
+- model accuracy
+
+```{r}
+nextword <- function(phrase) {
+  wordlist <- data.frame(txt_lines=phrase, stringsAsFactors = FALSE) %>% 
+    unnest_tokens(word, txt_lines)
+  
+  lastthree <- tail(wordlist, 3)
+  
+  if (nrow(lastthree)==3) {
+    potential_matches <- quadgrams %>%
+      filter(word1==lastthree[1,]) %>%
+      filter(word2==lastthree[2,]) %>%
+      filter(word3==lastthree[3,]) %>%
+      arrange(desc(logprob))
+  }
+  
+  if (nrow(lastthree)==2 | nrow(potential_matches)==0) {
+    potential_matches <- trigrams %>%
+      filter(word2==tail(lastthree,1)$word) %>%
+      filter(word1==head(tail(lastthree,2),1)$word) %>%
+      arrange(desc(logprob))
+  }
+  
+  if (nrow(lastthree)==1 | nrow(potential_matches)==0) {
+    potential_matches <- bigrams %>%
+      filter(word1==tail(lastthree,1)$word) %>%
+      arrange(desc(logprob))
+  }
+
+  return(potential_matches)
+}
+```
+
+## Quiz Predictions
+
+```{r}
+# read in the quiz sentences
+con <- file("quiz3_sentences.txt", open="r")
+sentences <- readLines(con)
+close(con)
+sentences
+```
+
+```{r}
+nextword(sentences[1])
+```
+
+```{r}
+nextword(sentences[2])
+```
+
+```{r}
+nextword(sentences[3])
+```
+
+```{r}
+nextword(sentences[4])
+```
+
+```{r}
+nextword(sentences[5])
+```
+
+```{r}
+nextword(sentences[6])
+```
+
+```{r}
+nextword(sentences[7])
+```
+
+```{r}
+nextword(sentences[8])
+```
+
+```{r}
+nextword(sentences[9])
+```
+
+```{r}
+nextword(sentences[10])
+```
+
+```{r}
+gc()
+memory.size()
+```
