@@ -191,15 +191,14 @@ head(corpora_trigrams_filtered)
 ## Model Storage Considerations
 We can also draw a graph from the bigrams to get an idea of how words are related.  Looking at graph storage and query might be a way to optimize the n-gram model later on.  This graph is of the bigrams with more than 500 occurances.
 ```{r}
-# filter for common combinations
-bigram_graph <- corpora_bigrams_filtered %>%
+corpora_bigrams_filtered %>%
   filter(n > 500) %>%
-  graph_from_data_frame()
-
-ggraph(bigram_graph, layout = "fr") +
-  geom_edge_link() +
-  geom_node_point() +
-  geom_node_text(aes(label = name), vjust = 1, hjust = 1)
+  graph_from_data_frame() %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(edge_alpha = n, edge_width = n)) +
+  geom_node_point(color = "darkslategray4", size = 2) +
+  geom_node_text(aes(label = name), vjust = 1, hjust = 1, size=3) +
+  labs(title= "Bigram Graph", subtitle="", x="", y="")
 ```
 
 
