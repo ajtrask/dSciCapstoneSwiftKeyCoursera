@@ -35,6 +35,16 @@ vignettes/*.pdf
 # Ignore data folder
 final
 *.dcf
+
+# Ignore sampled files
+# These are created by the code
 en_US.twitter.sampled.txt
 en_US.news.sampled.txt
 en_US.blogs.sampled.txt
+
+# Ignore quiz question and answers
+# These were used to test the model and answer the quizes, but should not be shared publicly
+quiz2_sentences.txt
+quiz2_answers.txt
+quiz3_sentences.txt
+quiz3_answers.txt
