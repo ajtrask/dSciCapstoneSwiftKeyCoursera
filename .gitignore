@@ -36,6 +36,9 @@ vignettes/*.pdf
 final
 *.dcf
 
+# Ignore auto generated html files
+*.nb.html
+
 # Ignore sampled files
 # These are created by the code
 en_US.twitter.sampled.txt
