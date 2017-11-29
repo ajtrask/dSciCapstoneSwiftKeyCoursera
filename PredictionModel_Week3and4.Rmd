@@ -1,0 +1,390 @@
+---
+title: "Word Prediction Model"
+author: "Aaron Trask"
+date: "November 1, 2017"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+## Designing a Prediction Model
+
+```{r, message=FALSE}
+source("ngram_model_support_functions.R")
+
+library(tidyverse)
+library(stringr)
+library(tidytext)
+library(doParallel)
+library(data.table)
+library(microbenchmark)
+library(profvis)
+library(ggplot2)
+#library(dplyr)
+#library(ggplot2)
+library(hunspell)
+#library(tidyr)
+library(igraph)
+library(ggraph)
+#library(widyr)
+
+# compute the number of cores for building a parallel cluster later
+ncores <- detectCores() - 1
+ncores
+```
+
+## Data Preparation
+
+We will work with the sampled files.  If they are not already in the directory, sample_source_files will be run to create them.
+```{r}
+sample_en_files <- Sys.glob("en_US.*.sampled.txt")
+
+if (length(sample_en_files)<1) {
+  # get the list of source files
+  en_files <- Sys.glob("final/en_US/*.txt")
+  
+  # look at about 5% of the lines in the files
+  sample_prob <- 0.05
+  
+  # sample the source files and write sampled files
+  sample_en_files <- sample_source_files(en_files, sample_prob)
+}
+
+file.info(sample_en_files)
+```
+
+Read in the files:
+```{r}
+allLines <- read_text(sample_en_files)
+head(allLines)
+```
+
+Split sentences into additional rows:
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# split into sentences to avoid sentence continuation n-grams
+allLines <- allLines %>%
+  unnest_tokens(sentence, text, token = "sentences")
+
+# stop the cluster
+stopCluster(mycluster)
+
+head(allLines)
+```
+
+Remove any leading or trailing white space, remove multiple spaces, replace curly quotes with straight, and remove all punctuation except for apostrophe and dash:
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# replace curly with straight quotes
+# and remove all punctuation except for apostrophe
+allLines$sentence <- allLines$sentence %>%
+  str_trim() %>%
+  str_replace_all(c("\\s+" = " ",
+                    "[\u2018\u2019]" = "'",
+                    "[\u201C\u201D]" = "\"",
+                    "[^\'-[:alpha:]\\s]" = ""))
+
+# stop the cluster
+stopCluster(mycluster)
+
+head(allLines)
+```
+
+Read in profanity word list from Shutterstock project located at: https://github.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words
+```{r}
+con <- file("../List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/en", open="r")
+profanity <- readLines(con)
+close(con)
+```
+
+Here we drop sentences that contain offensive words or phrases as defined in the list above.  This is an area that needs some work as the list contains some things that are benign depending on context.  It also might not have everything that is offensive which is subjective as well.  Leet speak would also pass through.
+```{r}
+print(paste("Sentences before stripping profanity:", nrow(allLines)))
+
+allLines <- allLines[!grepl(paste(profanity, collapse=" | "), allLines$sentence),]
+
+print(paste("Sentences after stripping profanity:", nrow(allLines)))
+```
+
+Create unigrams
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# create unigrams and compute probabilities
+n1grams <- allLines %>%
+  unnest_tokens(word, sentence) %>%
+  #filter_at(vars(starts_with("word")), any_vars(hunspell_check(word, dict = "en_US"))) %>%
+  count(word, sort = TRUE) %>%
+  mutate(freq = n / sum(n)) %>%
+  arrange(word)
+
+# stop the cluster
+stopCluster(mycluster)
+
+# convert to data.table
+setDT(n1grams)
+
+# save unigrams to binary RDS format
+saveRDS(n1grams[n1grams$n>1, c("word","freq")], "n1grams.rds")
+
+head(n1grams)
+```
+
+Create bigrams
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# create unigrams and compute probabilities
+n2grams <- allLines %>%
+  unnest_tokens(ngram, sentence, token = "ngrams", n = 2) %>%
+  count(ngram, sort = TRUE) %>%
+  extract(ngram, into=c('ngram', 'pred'), '(.*)\\s+([^ ]+)$') %>%
+  left_join(n1grams %>% select(ngram = word, freq2 = freq), by = "ngram") %>%
+  mutate(freq = n/sum(n)) %>%
+  mutate(score = freq/freq2) %>%
+  arrange(ngram)
+
+# stop the cluster
+stopCluster(mycluster)
+
+# remove n1grams from memory since we are done with them
+remove(n1grams)
+
+# convert to data.table
+setDT(n2grams)
+
+# save unigrams to binary RDS format
+saveRDS(n2grams[n2grams$n>1, c("ngram","pred","score")], "n2grams.rds")
+
+head(n2grams)
+```
+
+Create trigrams
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# create unigrams and compute probabilities
+n3grams <- allLines %>%
+  unnest_tokens(ngram, sentence, token = "ngrams", n = 3) %>%
+  count(ngram, sort = TRUE) %>%
+  extract(ngram, into=c('ngram', 'pred'), '(.*)\\s+([^ ]+)$') %>%
+  left_join(n2grams %>% 
+              unite(ngram,c('ngram','pred'),sep=" ") %>%
+              select(ngram = ngram, freq2 = freq), by = "ngram") %>%
+  mutate(freq = n/sum(n)) %>%
+  mutate(score = freq/freq2) %>%
+  arrange(ngram)
+
+# stop the cluster
+stopCluster(mycluster)
+
+# remove n2grams from memory since we are done with them
+remove(n2grams)
+
+# convert to data.table
+setDT(n3grams)
+
+# save unigrams to binary RDS format
+saveRDS(n3grams[n3grams$n>1, c("ngram","pred","score")], "n3grams.rds")
+
+head(n3grams)
+```
+
+Create n4grams
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# create unigrams and compute probabilities
+n4grams <- allLines %>%
+  unnest_tokens(ngram, sentence, token = "ngrams", n = 4) %>%
+  count(ngram, sort = TRUE) %>%
+  extract(ngram, into=c('ngram', 'pred'), '(.*)\\s+([^ ]+)$') %>%
+  left_join(n3grams %>% 
+              unite(ngram,c('ngram','pred'),sep=" ") %>%
+              select(ngram = ngram, freq2 = freq), by = "ngram") %>%
+  mutate(freq = n/sum(n)) %>%
+  mutate(score = freq/freq2) %>%
+  arrange(ngram)
+
+# stop the cluster
+stopCluster(mycluster)
+
+# remove n3grams from memory since we are done with them
+remove(n3grams)
+
+# convert to data.table
+setDT(n4grams)
+
+# save unigrams to binary RDS format
+saveRDS(n4grams[n4grams$n>1, c("ngram","pred","score")], "n4grams.rds")
+
+head(n4grams)
+```
+
+Clear remaining data before loading from disk and building predictor code:
+```{r}
+remove(n4grams,allLines)
+```
+
+Stupid Backoff Model
+```{r}
+# load the ngrams:
+n1grams <- readRDS("n1grams.rds")
+n2grams <- readRDS("n2grams.rds")
+n3grams <- readRDS("n3grams.rds")
+n4grams <- readRDS("n4grams.rds")
+
+top_three_words <- n1grams %>% 
+  arrange(desc(freq)) %>% 
+  head(20) %>% 
+  mutate(ngram="") %>%
+  rename(pred = word, score = freq)
+
+predictWords <- function(phrase, backoff_factor=0.4, num_predictions=3) {
+  
+  ngram_order <- 4
+  
+  words <- str_split(str_to_lower(phrase), " ")[[1]]
+  num_words <- length(words)
+  
+  preds <- data.frame(ngram=character(),
+                 pred=character(),
+                 score=double(),
+                 stringsAsFactors=FALSE)
+  
+  # loop down to bigrams
+  for (i in ngram_order:2) {
+    #print(num_words)
+    #print(words)
+    
+    # search ngram level if we have enough words in the phrase
+    if (num_words >= i-1) {
+      
+      # setup backoff_factor for this ngram level
+      bos <- backoff_factor^(i-ngram_order)
+      
+      # create search ngram
+      search_gram <- paste(words[(num_words-(i-2)):num_words], collapse = " ")
+      #print(search_gram)
+      
+      # append prediction scores if ngram found
+      preds <- rbind(preds,
+                     eval(as.symbol(paste("n",i,"grams",sep=""))) %>%
+                       filter(ngram==search_gram) %>%
+                       mutate(score = bos*score)) %>% 
+        group_by(pred) %>%
+        top_n(1, score) %>%
+        ungroup() %>%
+        arrange(desc(score)) %>%
+        head(num_predictions)
+    }
+  }
+  
+  # add in the top three unigrams to fill out the prediction if needed
+  preds <- rbind(preds,top_three_words) %>% 
+    group_by(pred) %>% 
+    top_n(1, score) %>%
+    ungroup() %>%
+    arrange(desc(score)) %>%
+    head(num_predictions)
+  
+  return(preds)
+}
+
+```
+
+Quiz 2 Predictions:
+```{r}
+quiz2 <- readLines("quizes/quiz2_sentences.txt")
+for (phrase in quiz2) {
+  print(paste(predictWords(phrase,0.4,10)$pred,collapse = ","))
+}
+```
+
+Quiz 3 Predictions:
+```{r}
+quiz3 <- readLines("quizes/quiz3_sentences.txt")
+for (phrase in quiz3) {
+  print(paste(predictWords(phrase,0.4,10)$pred,collapse = ","))
+}
+```
+
+Predicted word relationship graph:
+```{r}
+# example phrase
+ex_phrase <- "this is asd'fdg 12"
+# run phrase for predictions
+predictions <- predictWords(ex_phrase,0.4,3)
+print(predictions)
+
+# phrases and words
+graph_words <- data.frame(phrase=c(predictions$ngram,predictions$pred,ex_phrase),stringsAsFactors = FALSE) %>%
+  unnest_tokens(word, phrase) %>%
+  count(word, sort = TRUE)
+
+print(graph_words)
+```
+
+```{r}
+# build bigram graph
+bigram_graph <- n2grams %>%
+  rename(from=ngram,to=pred) %>%
+  graph_from_data_frame()
+```
+
+```{r}
+# query graph for vertex ids
+verts <- graph_words$word
+verts <- match(verts, V(bigram_graph)$name)
+verts <- verts[!is.na(verts)]
+print(verts)
+
+```
+
+```{r}
+# create subgraph from bigram_predictions
+bigram_subgraph <- induced_subgraph(bigram_graph, verts, impl = "auto")
+
+#ggraph(bigram_subgraph, layout = "auto") +
+#  geom_edge_link() +
+#  geom_node_point() +
+#  geom_node_text(aes(label = name), vjust = 1, hjust = 1)
+
+ggraph(bigram_subgraph, layout = 'kk') + 
+  geom_edge_link(aes(colour = 'red')) + 
+  geom_node_point() +
+  geom_node_text(aes(label = name), vjust = 1, hjust = 1) + 
+  ggtitle('Word Prediction Relational Graph') +
+  theme(axis.line=element_blank(),axis.text.x=element_blank(),
+        axis.text.y=element_blank(),axis.ticks=element_blank(),
+        axis.title.x=element_blank(),axis.title.y=element_blank(),
+        legend.position="none",panel.grid.major=element_blank(),
+        panel.grid.minor=element_blank(),plot.background=element_blank())
+    
+```

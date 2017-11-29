@@ -34,6 +34,18 @@ vignettes/*.pdf
 
 # Ignore data folder
 final
+
+# Ignore quiz working folder
+quizes
+
+# Ignore experimentation folder
+experimentation
+
+# Ignore RDS files
+*.rds
+
+# ignore these
+*.html
 *.dcf
 en_US.twitter.sampled.txt
 en_US.news.sampled.txt

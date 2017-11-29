@@ -1,0 +1,641 @@
+---
+title: "Word Prediction Model"
+author: "Aaron Trask"
+date: "November 1, 2017"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+## Designing a Prediction Model
+
+```{r, message=FALSE}
+library(tidyverse)
+library(stringr)
+library(tidytext)
+library(doParallel)
+library(data.table)
+library(microbenchmark)
+library(profvis)
+library(ggplot2)
+#library(dplyr)
+#library(ggplot2)
+library(hunspell)
+#library(tidyr)
+#library(igraph)
+#library(ggraph)
+#library(widyr)
+
+# compute the number of cores for building a parallel cluster later (remove one so that if it freezes you can still kill the process)
+ncores <- detectCores() - 1
+ncores
+```
+
+
+
+
+## Data Preparation
+
+We are working with the sampled files.  Run sampleSourceFiles.R if they do not exist.
+```{r}
+sample_en_files <- Sys.glob("en_US.*.sampled.txt")
+file.info(sample_en_files)
+```
+
+Create function for reading in files:
+```{r}
+read_text <- function(files) {
+  # empty data frame for text lines
+  df <- data.frame()
+  
+  # loop over files
+  for (i in 1:length(files)) {
+    # open connection to file
+    con <- file(files[i], open="r")
+    
+    # read all lines from file
+    allLines <- readLines(con,encoding = "UTF-8")
+    
+    # close connection to file
+    close(con)
+    
+    # append lines to data frame
+    df <- rbind(df, data.frame(text=allLines, stringsAsFactors = FALSE))
+  }
+  
+  # add lineID column
+  df <- df %>% rowid_to_column("lineID")
+  
+  return(df)
+}
+```
+
+Read in the files:
+```{r}
+allLines <- read_text(sample_en_files)
+head(allLines)
+```
+
+```{r}
+someLines <- head(allLines, 1000)
+```
+
+Split sentences into additional rows:
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# split into sentences to avoid sentence continuation n-grams
+someLines <- someLines %>%
+  unnest_tokens(sentence, text, token = "sentences")
+
+# stop the cluster
+stopCluster(mycluster)
+```
+
+Remove any leading or trailing white space, remove multiple spaces, replace curly quotes with straight, and remove all punctuation except for apostrophe and dash:
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# replace curly with straight quotes
+# and remove all punctuation except for apostrophe
+someLines$sentence <- someLines$sentence %>%
+  str_trim() %>%
+  str_replace_all(c("\\s+" = " ",
+                    "[\u2018\u2019]" = "'",
+                    "[\u201C\u201D]" = "\"",
+                    "[^\'-[:alpha:]\\s]" = ""))
+
+# stop the cluster
+stopCluster(mycluster)
+
+head(someLines)
+```
+
+Read in profanity word list from Shutterstock project located at: https://github.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words
+```{r}
+con <- file("../List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/en", open="r")
+profanity <- readLines(con)
+close(con)
+```
+
+Create unigrams and their probability
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# create unigrams and compute probabilities
+unigram_probs <- someLines %>%
+  unnest_tokens(word, sentence) %>%
+  filter_at(vars(starts_with("word")), any_vars(!(. %in% profanity))) %>%
+  #filter_at(vars(starts_with("word")), any_vars(hunspell_check(word, dict = "en_US"))) %>%
+  count(word, sort = TRUE) %>%
+  mutate(p = n / sum(n)) %>%
+  arrange(desc(p))
+
+num_wrds <- sum(unigram_probs$n)
+
+# stop the cluster
+stopCluster(mycluster)
+
+head(unigram_probs)
+```
+
+```{r}
+# convert to data.table
+setDT(unigram_probs)
+
+# save unigrams to binary RDS format
+saveRDS(unigram_probs[, c("word","p")], "unigrams.rds")
+
+```
+
+Create bigrams and their probability
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# create bigrams and probabilities
+bigram_probs <- someLines %>%
+  unnest_tokens(ngram, sentence, token = "ngrams", n = 2) %>%
+  count(ngram, sort = TRUE) %>%
+  separate(ngram, c("word1", "word2"), sep = " ") %>%
+  left_join(unigram_probs %>% select(word2 = word, n2 = n), by = "word2") %>%
+  mutate(p = n / n2) %>%
+  filter_at(vars(starts_with("word")), any_vars(!(. %in% profanity))) %>%
+  arrange(desc(n))
+
+num_bigrams <- sum(bigram_probs$n)
+
+# stop the cluster
+stopCluster(mycluster)
+
+head(bigram_probs)
+```
+
+Free up some memory:
+```{r}
+rm(unigram_probs)
+```
+
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# compute number of bigrams words complete
+bigrams_completed <- bigram_probs %>%
+  group_by(word2) %>% 
+  summarise(n_bi_comp = sum(n), n_bi = n_distinct(word1)) %>%
+  arrange(desc(n_bi_comp))
+
+# stop the cluster
+stopCluster(mycluster)
+
+head(bigrams_completed)
+```
+
+Calculate Kneser-Ney Smoothing:
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# compute Kneser-Ney smoothed probabilities
+bigram_probs <- bigram_probs %>%
+  left_join(bigrams_completed %>% select(word2 = word2, n_bi_comp = n_bi_comp, n_bi=n_bi), by = "word2") %>%
+  rowwise() %>% 
+  mutate(p_discounted = max(n-0.75,0)/n2) %>%
+  ungroup() %>%
+  mutate(p_continuation = n_bi_comp/num_bigrams) %>%
+  mutate(lambda = (0.75/n2)*n_bi) %>%
+  mutate(p_kn = p_discounted+lambda*p_continuation) %>%
+  arrange(desc(p_kn))
+
+# stop the cluster
+stopCluster(mycluster)
+
+head(bigram_probs)
+```
+
+Free up some memory:
+```{r}
+rm(bigrams_completed)
+```
+
+```{r}
+# convert to data.table
+setDT(bigram_probs)
+
+# save unigrams to binary RDS format
+saveRDS(bigram_probs[, c("word1","word2","p_kn")], "bigrams.rds")
+```
+
+Create trigrams and their probability:
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# create trigrams and probabilities
+trigram_probs <- someLines %>%
+  unnest_tokens(ngram, sentence, token = "ngrams", n = 3) %>%
+  count(ngram, sort = TRUE) %>%
+  separate(ngram, c("word1", "word2", "word3"), sep = " ") %>%
+  left_join(bigram_probs %>% select(word1 = word1, word2 = word2, n2 = n), by = c("word1"="word1","word2"="word2")) %>%
+  mutate(p = n / n2) %>%
+  arrange(desc(p))
+
+num_trigrams <- sum(trigram_probs$n)
+
+# stop the cluster
+stopCluster(mycluster)
+
+head(trigram_probs)
+```
+
+Free up some memory:
+```{r}
+rm(bigram_probs)
+```
+
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# compute number of trigrams words complete
+trigrams_completed <- trigram_probs %>%
+  group_by(word3) %>% 
+  summarise(n_tri_comp = sum(n), n_tri = n_distinct(interaction(word1,word2))) %>%
+  arrange(desc(n_tri_comp))
+  
+# stop the cluster
+stopCluster(mycluster)
+
+head(trigrams_completed)
+```
+
+Calculate Kneser-Ney Smoothing:
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# compute Kneser-Ney smoothed probabilities
+trigram_probs <- trigram_probs %>%
+  left_join(trigrams_completed %>% select(word3 = word3, n_tri_comp = n_tri_comp, n_tri=n_tri), by = "word3") %>%
+  rowwise() %>% 
+  mutate(p_discounted = max(n-0.75,0)/n2) %>%
+  ungroup() %>%
+  mutate(p_continuation = n_tri_comp/num_trigrams) %>%
+  mutate(lambda = (0.75/n2)*n_tri) %>%
+  mutate(p_kn = p_discounted+lambda*p_continuation) %>%
+  arrange(desc(p_kn))
+
+# stop the cluster
+stopCluster(mycluster)
+
+head(trigram_probs)
+```
+
+Free up some memory:
+```{r}
+rm(trigrams_completed)
+```
+
+```{r}
+# convert to data.table
+setDT(trigram_probs)
+
+# save unigrams to binary RDS format
+saveRDS(trigram_probs[, c("word1","word2","word3","p_kn")], "trigrams.rds")
+```
+
+Create quadgrams and their probability
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# create quadgrams and probabilities
+quadgram_probs <- someLines %>%
+  unnest_tokens(ngram, sentence, token = "ngrams", n = 4) %>%
+  count(ngram, sort = TRUE) %>%
+  separate(ngram, c("word1", "word2", "word3", "word4"), sep = " ") %>%
+  left_join(trigram_probs %>% select(word1 = word1, word2 = word2, word3 = word3, n2 = n), by = c("word1"="word1","word2"="word2","word3"="word3")) %>%
+  mutate(p = n / n2) %>%
+  arrange(desc(p))
+
+num_quadgrams <- sum(quadgram_probs$n)
+
+# stop the cluster
+stopCluster(mycluster)
+
+head(quadgram_probs)
+```
+
+Free up some memory:
+```{r}
+rm(trigram_probs)
+```
+
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# compute number of quadgrams words complete
+quadgrams_completed <- quadgram_probs %>%
+  group_by(word4) %>% 
+  summarise(n_quad_comp = sum(n), n_quad = n_distinct(interaction(word1,word2,word3))) %>%
+  arrange(desc(n_quad_comp))
+  
+# stop the cluster
+stopCluster(mycluster)
+
+head(quadgrams_completed)
+```
+
+Calculate Kneser-Ney Smoothing:
+```{r}
+# create a cluster
+mycluster <- makeCluster(ncores)
+
+# register the cluster
+registerDoParallel(mycluster)
+
+# compute Kneser-Ney smoothed probabilities
+quadgram_probs <- quadgram_probs %>%
+  left_join(quadgrams_completed %>% select(word4 = word4, n_quad_comp = n_quad_comp, n_quad=n_quad), by = "word4") %>%
+  rowwise() %>% 
+  mutate(p_discounted = max(n-0.75,0)/n2) %>%
+  ungroup() %>%
+  mutate(p_continuation = n_quad_comp/num_quadgrams) %>%
+  mutate(lambda = (0.75/n2)*n_quad) %>%
+  mutate(p_kn = p_discounted+lambda*p_continuation) %>%
+  arrange(desc(p_kn))
+
+# stop the cluster
+stopCluster(mycluster)
+
+head(quadgram_probs)
+```
+
+Free up some memory:
+```{r}
+rm(quadgrams_completed)
+```
+
+```{r}
+# convert to data.table
+setDT(quadgram_probs)
+
+# save unigrams to binary RDS format
+saveRDS(quadgram_probs[, c("word1","word2","word3","word4","p_kn")], "quadgrams.rds")
+```
+
+
+
+
+# OLDER STUFF BELOW TO REMOVE
+
+
+
+Create function for creating and cleaning ngram data frames.
+```{r}
+create_ngrams <- function(files,n) {
+  # create empty data frame
+  df <- data.frame()
+
+  # loop over files and convert to corpora
+  for (i in 1:length(files)) {
+    
+    # read in the file to a data frame with rows for each line
+    con <- file(files[i], open="r")
+    allLines <- readLines(con)
+    close(con)
+    
+    # tokenize into ngrams
+    ngrams <- data.frame(txt_lines=allLines, stringsAsFactors = FALSE) %>% 
+      unnest_tokens(ngram, txt_lines, token = "ngrams", n = n)
+    
+    # append data frame
+    df <- rbind(df, ngrams)
+  }
+  
+  # add word count and separate words
+  cols <- paste(rep("word",n), c(1:n), sep="")
+  df <- df %>%
+    count(ngram, sort = TRUE) %>%
+    ungroup() %>%
+    separate(ngram, cols, sep = " ")
+  
+  # read in profanity word list from Shutterstock project located at
+  # https://github.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words
+  con <- file("../List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/en", open="r")
+  profanity <- readLines(con)
+  close(con)
+
+  # filter out profanity, non-alphabetic characters, and 3 or more
+  # repeated characters
+  df <- df %>%
+    # only keep words that aren't profanity
+    filter_at(vars(starts_with("word")), any_vars(!(. %in% profanity))) %>%
+    # only keep words with alphabetic characters
+    filter_at(vars(starts_with("word")), any_vars(str_detect(., "^[:alpha:]+$"))) %>%
+    # remove words with 3 or more repeated characters
+    filter_at(vars(starts_with("word")), any_vars(!str_detect(., "([:alpha:])\\1{2,}"))) #%>%
+    # remove words not in the english dictionary
+    #filter_at(vars(starts_with("word")), any_vars(hunspell_check(word, dict = "en_US")))
+  
+  # calculate count of ngrams
+  total_ngrams <- df %>%  summarize(total = sum(n))
+
+  # compute probability
+  #df$prob <- df$n/total_ngrams$total
+  
+  # compute log(p)
+  df$logprob <- log(df$n) - log(total_ngrams$total)
+  
+  return(df)
+}
+```
+
+
+TODO: keep hash tags
+TODO: keep ampersands
+TODO: replace contractions with words
+TODO: filter profanity inside concatenated words
+
+```{r}
+unigrams <- create_ngrams(sample_en_files,1)
+head(unigrams)
+```
+
+```{r}
+bigrams <- create_ngrams(sample_en_files,2)
+head(bigrams)
+```
+
+```{r}
+trigrams <- create_ngrams(sample_en_files,3)
+head(trigrams)
+```
+
+```{r}
+quadgrams <- create_ngrams(sample_en_files,4)
+head(quadgrams)
+```
+
+## Model
+
+Trades:
+- model size
+- model runtime
+- model accuracy
+
+```{r}
+nextword <- function(phrase) {
+  wordlist <- data.frame(txt_lines=phrase, stringsAsFactors = FALSE) %>% 
+    unnest_tokens(word, txt_lines)
+  
+  lastthree <- tail(wordlist, 3)
+  
+  
+  # this returns potential matches from the quadgrams
+  if (nrow(lastthree)==3) {
+    potential_matches <- quadgrams %>%
+      filter(word1==lastthree[1,]) %>%
+      filter(word2==lastthree[2,]) %>%
+      filter(word3==lastthree[3,]) %>%
+      arrange(desc(logprob))
+  }
+  
+  # if no quadgrams found or if only two words provided, this returns potential matches from the trigrams
+  if (nrow(lastthree)==2 | nrow(potential_matches)==0) {
+    potential_matches <- trigrams %>%
+      filter(word2==tail(lastthree,1)$word) %>%
+      filter(word1==head(tail(lastthree,2),1)$word) %>%
+      arrange(desc(logprob))
+  }
+  
+  # if no trigrams found or if only one word provided, this returns potential matchs from the bigrams
+  if (nrow(lastthree)==1 | nrow(potential_matches)==0) {
+    potential_matches <- bigrams %>%
+      filter(word1==tail(lastthree,1)$word) %>%
+      arrange(desc(logprob))
+  }
+  
+  # if no bigrams found, return top three unigrams
+  if (nrow(potential_matches)==0) {
+    potential_matches <- unigrams %>%
+      arrange(desc(logprob)) %>%
+      head(3)
+  }
+
+  return(potential_matches)
+}
+```
+
+## Kneser-Ney Language Model
+
+```{r}
+bigram_count <- count(bigrams)$nn
+bigram_count
+```
+
+```{r}
+trial_cont_prob <- by(unigrams, 1:nrow(unigrams), function(row) count(bigrams[bigrams$word2==row$word1,])/bigram_count)
+head(trial_cont_prob)
+```
+
+```{r}
+unigrams[1,]$word1
+```
+
+```{r}
+bigrams[bigrams$word2=="the",]
+```
+
+## Quiz Predictions
+
+```{r}
+# read in the quiz sentences
+con <- file("quiz3_sentences.txt", open="r")
+sentences <- readLines(con)
+close(con)
+sentences
+```
+
+```{r}
+nextword(sentences[1])
+```
+
+```{r}
+nextword(sentences[2])
+```
+
+```{r}
+nextword(sentences[3])
+```
+
+```{r}
+nextword(sentences[4])
+```
+
+```{r}
+nextword(sentences[5])
+```
+
+```{r}
+nextword(sentences[6])
+```
+
+```{r}
+nextword(sentences[7])
+```
+
+```{r}
+nextword(sentences[8])
+```
+
+```{r}
+nextword(sentences[9])
+```
+
+```{r}
+nextword(sentences[10])
+```
+
+```{r}
+gc()
+memory.size()
+```
